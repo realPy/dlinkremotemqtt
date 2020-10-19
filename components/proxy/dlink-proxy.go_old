@@ -1,0 +1,588 @@
+package dlinkproxy
+
+
+
+import "net/http"
+import "fmt"
+import "errors"
+//import "io"
+//import "time"
+import "bufio"
+import "strconv"
+import "strings"
+import dlinkremotemqttconfig "dlink-remote-mqtt/components/config"
+
+type ProxyListener struct {
+	DataChannel chan []byte
+  waitingHeader chan bool
+}
+
+type ProxyMJPEG struct {
+	url         string
+	username    string
+	password    string
+	listeners map[*ProxyListener]bool
+  io chan ioListenerMsg
+  stop chan bool
+  header http.Header
+
+}
+
+type ioListenerMsg interface {
+  message () interface{}
+}
+type SubscribeListener struct {
+  listener *ProxyListener
+}
+
+type UnsubscribeListener struct {
+  listener *ProxyListener
+}
+
+type PayloadListeners struct {
+  data []byte
+}
+
+type HeaderStream struct {
+  header  http.Header
+}
+
+
+type ErrorStream struct {
+  err error
+}
+
+
+func (s SubscribeListener ) message () (interface {}) {
+return s
+}
+
+func (u UnsubscribeListener ) message () (interface {}) {
+return u
+}
+
+func (p PayloadListeners ) message () (interface {}) {
+return p
+}
+
+func (e ErrorStream ) message () (interface {}) {
+return e
+}
+
+func (h HeaderStream ) message () (interface {}) {
+return h
+}
+
+
+func NewProxyListener() *ProxyListener {
+	listener := new(ProxyListener)
+
+	listener.DataChannel = make(chan []byte)
+  listener.waitingHeader=make(chan bool)
+	return listener
+}
+
+
+func newProxyMJPEG(url string,username string,password string) (*ProxyMJPEG) {
+
+  proxy := new(ProxyMJPEG)
+	proxy.url = url
+	proxy.username = username
+	proxy.password = password
+	proxy.listeners = make(map[*ProxyListener]bool)
+  proxy.io = make(chan ioListenerMsg)
+  proxy.stop=make(chan bool)
+  proxy.header=nil
+	return proxy
+
+}
+
+func (p *ProxyMJPEG )addListener (listener *ProxyListener) {
+   msg:= SubscribeListener{listener:listener}
+   p.io <- msg
+
+}
+
+func (p *ProxyMJPEG )removeListener (listener *ProxyListener) {
+   fmt.Printf("try send unsubscribe\n")
+   msg:= UnsubscribeListener{listener:listener}
+   p.io <- msg
+   fmt.Printf("send unsubscribe ok \n")
+}
+
+
+func (p *ProxyMJPEG )writeData (listener *ProxyListener,payload PayloadListeners) {
+
+
+defer func() {
+       // recover from panic caused by writing to a closed channel
+       if r := recover(); r != nil {
+
+           fmt.Printf("write: error writing on channel: %v\n", listener.DataChannel)
+           return
+       }
+
+
+   }()
+
+   listener.DataChannel <- payload.data
+}
+
+func getHeaderBoundary(resp http.Response) (string, error) {
+	ct := resp.Header.Get("Content-Type")
+	prefix := "multipart/x-mixed-replace;boundary="
+	if !strings.HasPrefix(ct, prefix) {
+		err_str := fmt.Sprintf("Content-Type is invalid (%s)", ct)
+		return "", errors.New(err_str)
+	}
+
+	boundary := "--" + strings.TrimPrefix(ct, prefix)
+	return boundary, nil;
+}
+
+
+func connectTVHStream(url string) (*http.Response, error) {
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		err_str := fmt.Sprintf("Request failed (%s)", resp.Status)
+		return nil,  errors.New(err_str)
+	}
+
+
+
+	return resp, nil;
+}
+
+func connectMJPEGStream(url, username, password string) (*http.Response, string, error) {
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if username != "" && password != "" {
+		req.SetBasicAuth(username, password)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		err_str := fmt.Sprintf("Request failed (%s)", resp.Status)
+		return nil, "", errors.New(err_str)
+	}
+
+	boundary, err := getHeaderBoundary(*resp)
+	if err != nil {
+		resp.Body.Close()
+		return nil, "", err
+	}
+
+	return resp, boundary, nil;
+}
+
+
+
+func readChunkHeader(reader *bufio.Reader, boundary string) (head []byte, size int, err error) {
+	head = make([]byte, 0)
+	size = -1
+	err = nil
+
+	// read boundary
+	var line []byte
+	line, err = reader.ReadSlice('\n')
+	if err != nil {
+		return
+	}
+
+	line, err = reader.ReadSlice('\n')
+	if err != nil {
+		return
+        }
+	if bl := strings.TrimRight(string(line), "\r\n"); bl != boundary {
+		err_str := fmt.Sprintf("Invalid boundary received (%s)", bl)
+		err = errors.New(err_str)
+		return
+	}
+	head = append(head, line...)
+
+	// read header
+	for {
+		line, err = reader.ReadSlice('\n')
+		if err != nil {
+			return
+		}
+		head = append(head, line...)
+
+		// empty line marks end of header
+		line_str := strings.TrimRight(string(line), "\r\n")
+		if len(line_str) == 0 {
+			break
+		}
+
+		// find data size
+		parts := strings.SplitN(line_str, ": ", 2)
+		if strings.EqualFold(parts[0], "Content-Length") {
+			var n int
+			n, err = strconv.Atoi(string(parts[1]))
+			if err != nil {
+				return
+			}
+			size = n
+		}
+	}
+
+	if size == -1 {
+		err = errors.New("Content-Length chunk header not found")
+		return
+	}
+
+	return
+}
+
+func readChunkData(reader *bufio.Reader, size int) (buf []byte, err error) {
+	buf = make([]byte, size)
+	err = nil
+
+	pos := 0
+	for pos < size {
+		var n int
+		n, err = reader.Read(buf[pos:])
+		if err != nil {
+			return
+		}
+
+		pos += n
+	}
+
+	return
+}
+
+
+
+
+func (p *ProxyMJPEG )mjpegRequest () {
+
+resp,boundary,err:=connectMJPEGStream(p.url,p.username,p.password)
+
+if err!=nil {
+   //error in connection so we stop send the message
+   msg:= ErrorStream{err:err}
+   p.io <- msg
+   if resp !=nil {
+     resp.Body.Close()
+   }
+   //error we quit
+   return
+}
+
+//we have the header we can attach and
+
+  //= resp.Header
+  //send message we have receive header
+  msg:= HeaderStream{header:resp.Header}
+  p.io <- msg
+
+  reader := bufio.NewReader(resp.Body)
+
+  ChunkLoop:
+  for {
+    select {
+      case <- p.stop:
+      fmt.Printf("Receive stop message")
+      return
+
+    //  case <-time.After(3 * time.Second):
+
+      default:
+        head, size, err := readChunkHeader(reader, boundary)
+     		if err != nil {
+          msg:= ErrorStream{err:err}
+          p.io <- msg
+     			break ChunkLoop
+     		}
+
+     		data, err := readChunkData(reader, size)
+     		if err != nil {
+          msg:= ErrorStream{err:err}
+          p.io <- msg
+     			break ChunkLoop
+     		}
+
+    		p.io <- PayloadListeners{data:append(head, data...)}
+
+    }
+
+
+  }
+
+
+}
+
+
+func (p *ProxyMJPEG )tvhRequest () {
+
+resp,err:=connectTVHStream("http://192.168.1.54:9981/stream/channelid/1958195915?profile=pass")
+
+if err!=nil {
+   //error in connection so we stop send the message
+   msg:= ErrorStream{err:err}
+   p.io <- msg
+   if resp !=nil {
+     resp.Body.Close()
+   }
+   //error we quit
+   return
+}
+
+//we have the header we can attach and
+
+  //= resp.Header
+  //send message we have receive header
+  msg:= HeaderStream{header:resp.Header}
+  p.io <- msg
+
+  reader := bufio.NewReader(resp.Body)
+
+  ChunkLoop:
+  for {
+    select {
+      case <- p.stop:
+      fmt.Printf("Receive stop message\n")
+      return
+
+    //  case <-time.After(3 * time.Second):
+
+      default:
+
+
+     		data, err := readChunkData(reader, 8192)
+     		if err != nil {
+          msg:= ErrorStream{err:err}
+          p.io <- msg
+     			break ChunkLoop
+     		}
+
+    		p.io <- PayloadListeners{data:data}
+
+    }
+
+
+  }
+
+
+}
+
+func (p *ProxyMJPEG ) distpatch () {
+
+  for {
+		select {
+		case data, ok := <- p.io:
+			if ok {
+        switch data.(type) {
+        case SubscribeListener:
+          fmt.Printf("Listener in progress\n")
+          p.listeners[data.(SubscribeListener).listener] = true
+          if (len(p.listeners) == 1) {
+            fmt.Printf("We start the HTTP GET\n")
+            go p.mjpegRequest()
+          }
+
+        case UnsubscribeListener:
+          fmt.Printf("UnsucribeListener in progress\n")
+          if (len(p.listeners) == 1) {
+            fmt.Printf("We stop the HTTP GET and wait the request end\n")
+            p.header=nil
+              go func () {
+                p.stop <- true
+              }()
+
+
+
+          }
+          delete(p.listeners, data.(UnsubscribeListener).listener)
+          //close(data.(UnsubscribeListener).listener.DataChannel)
+
+
+        //case RequestEnded:
+        case PayloadListeners:
+
+          for listener, _ := range p.listeners {
+
+
+            /*
+            select {
+            case listener.DataChannel <- data.(PayloadListeners).data: // try to send
+            default: // or skip this frame
+            }*/
+            p.writeData(listener,data.(PayloadListeners))
+            //listener.DataChannel <- data.(PayloadListeners).data
+          }
+
+        case ErrorStream:
+          fmt.Printf("Problem when open stream %s\n",data.(ErrorStream).err)
+
+          for listener, _ := range p.listeners {
+            close(listener.DataChannel)
+          }
+
+
+
+
+        case HeaderStream:
+            fmt.Printf("Finaly we have receive the headers %v\n",data.(HeaderStream).header)
+            p.header=data.(HeaderStream).header
+            for listener, _ := range p.listeners {
+              select {
+              case listener.waitingHeader <- true: // try to send
+              default: // or skip this frame
+              }
+            }
+            //we can
+        default:
+          fmt.Printf("Unknown type message receive %t\n",data)
+        }
+
+
+      }
+		}
+	}
+
+}
+
+func (p *ProxyMJPEG ) proxyMJPEGHandler (w http.ResponseWriter, r *http.Request) (int, error) {
+
+
+
+  fmt.Printf("Server: client %s connected\n", r.RemoteAddr)
+
+
+
+
+
+ //w.Header().Set("Content-Type", "text/plain")
+
+  // prepare response for flushing
+  flusher, ok := w.(http.Flusher)
+  if !ok {
+    fmt.Printf("Server: client %s could not be flushed",
+      r.RemoteAddr)
+    return 503,errors.New("Can't flush with you")
+  }
+
+
+
+
+listener:=NewProxyListener()
+
+p.addListener(listener)
+
+if p.header==nil {
+  //we set the header if we already have it
+select {
+case <-listener.waitingHeader:
+  break
+case  _, ok := <-listener.DataChannel:
+  if(!ok) {
+    p.removeListener(listener)
+
+    return http.StatusInternalServerError,nil
+  }
+}
+
+}
+
+header := w.Header()
+for k, v := range p.header {
+  header[k] = v
+}
+
+loop:
+for {
+
+  // wait for next chunk
+  select {
+    case data, ok := <-listener.DataChannel:
+     if (ok) {
+      _, err := w.Write(data)
+      flusher.Flush()
+      // check for client close
+      if err != nil {
+        fmt.Printf("Server: client %s failed (%s)\n",
+          r.RemoteAddr, err)
+          close(listener.DataChannel)
+        break loop
+      }
+     } else {
+       fmt.Printf("May be closed channel")
+       return http.StatusInternalServerError,nil
+     }
+
+
+
+
+   }
+
+
+
+
+}
+
+
+     //http.Error(w, jsonStr, http.StatusInternalServerError)
+    //si on decide explicitement de s'arreter
+    p.removeListener(listener)
+
+    return http.StatusInternalServerError,nil
+
+
+}
+
+
+
+
+func (p *ProxyMJPEG) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    if status, err := p.proxyMJPEGHandler(w, r); err != nil {
+
+        switch status {
+        default:
+
+            // Catch any other errors we haven't explicitly handled
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+      }
+}
+
+
+
+
+func Routing(config *dlinkremotemqttconfig.Config) {
+	// check parameters
+
+  for  _, prox := range config.Server.Proxy {
+
+     proxy := newProxyMJPEG(fmt.Sprintf("http://%s/video/mjpg.cgi", prox.Ip), prox.Username, prox.Password)
+
+     http.Handle(prox.UrlMjpeg, proxy)
+     go proxy.distpatch()
+  }
+
+}

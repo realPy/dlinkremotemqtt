@@ -1,0 +1,16 @@
+server:
+  brokerMQTT: "tcp://brokerip:1883"
+  bindServer: ":8080"
+  proxy:
+   - ip: 192.168.1.254
+     urlMjpeg: /room1.mjpg
+     motionHA: true
+     friendly_name: "room1"
+     username: admin
+     password: password
+   - ip: 192.168.1.253
+     urlMjpeg: /room2.mjpg
+     motionHA: true
+     friendly_name: "room2"
+     username: admin
+     password: password

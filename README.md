@@ -11,7 +11,7 @@ This project was create to easyly integrate multiple dlink Webcam to homeassista
 
 ## How to compile
 
-`# go get && go build -o dlinkremotemqtt`
+`# go get && go build -o dlinkremotemqtt`
 
 ## Configuration
 

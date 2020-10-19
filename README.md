@@ -11,11 +11,11 @@ This project was create to easyly integrate multiple dlink Webcam to homeassista
 
 ## How to compile
 
-`# go get && go build -o dlinkremotemqtt`
+`# go get && go build -o dlinkremotemqtt`
 
 ## Configuration
 
-Dlinkremomqtt need a use the same mosquitto broker instance that homeassistant use.
+Dlinkremoteqtt need a use the same mosquitto broker instance that homeassistant use.
 
 The binary is run in foreground and need configuration file like this:
 

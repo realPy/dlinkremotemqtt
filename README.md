@@ -7,6 +7,7 @@ This project was create to easyly integrate multiple dlink Webcam to homeassista
  * Automatically configure webcam cam on home-assistant
  * Use the PIR and the remote motion as an occupancy sensor
  * Keep the latest image with movement in memory
+ * Control camera with mqtt message
 
 
 ## How to compile
@@ -15,7 +16,7 @@ This project was create to easyly integrate multiple dlink Webcam to homeassista
 
 ## Configuration
 
-Dlinkremomqtt need a use the same mosquitto broker instance that homeassistant use.
+Dlinkremoteqtt need use the same mosquitto broker instance that homeassistant use.
 
 The binary is run in foreground and need configuration file like this:
 
